@@ -1,3 +1,16 @@
 import { NextResponse } from "next/server";
+import { setSessionCookie } from "../../../../lib/http";
 import { register } from "../../../../lib/store";
-export async function POST(req:Request){try{const {name,email,password}=await req.json();if(!name||!email||!password||password.length<8)return NextResponse.json({error:"Name, email, and 8+ character password required"},{status:400});const out=await register(name,email,password);const res=NextResponse.json({user:out.user});res.cookies.set("session",out.token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:60*60*24*30,path:"/"});return res;}catch(e){return NextResponse.json({error:e instanceof Error?e.message:"Unable to register"},{status:400});}}
+import { parseCredentials } from "../../../../lib/validation";
+
+export async function POST(request: Request) {
+  try {
+    const { name, email, password } = parseCredentials(await request.json(), "register");
+    const result = await register(name, email, password);
+    const response = NextResponse.json({ user: result.user });
+    setSessionCookie(response, result.token);
+    return response;
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to register" }, { status: 400 });
+  }
+}

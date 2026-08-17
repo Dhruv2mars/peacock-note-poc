@@ -1,26 +1,237 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+import { promisify } from "node:util";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { getDatabase } from "../db";
+import { notes, rateLimits, sessions, shares, users } from "../db/schema";
+import type { CreateNoteInput } from "./validation";
 
-export type User = { id:string; name:string; email:string; passwordHash:string; createdAt:string };
-export type Note = { id:string; ownerId:string; title:string; content:string; createdAt:string };
-export type Share = { id:string; noteId:string; token:string; accessType:"public"|"password"; shareType:"one-time"|"time-based"; expiryAt:string|null; accessKeyHash:string|null; accessKeyHint:string|null; usedAt:string|null; revokedAt:string|null; viewCount:number; createdAt:string };
-type State = { users:User[]; notes:Note[]; shares:Share[]; sessions:{token:string; userId:string; createdAt:string}[] };
-const file = path.join(process.cwd(), ".data", "store.json");
-let queue = Promise.resolve();
-const blank = ():State => ({users:[],notes:[],shares:[],sessions:[]});
-const runtime = globalThis as typeof globalThis & { __linknoteState?: State };
-function load():State { if(process.env.VERCEL) return runtime.__linknoteState ?? (runtime.__linknoteState=blank()); try { return JSON.parse(fs.readFileSync(file,"utf8")); } catch { return blank(); } }
-function save(s:State) { if(process.env.VERCEL){ runtime.__linknoteState=s; return; } fs.mkdirSync(path.dirname(file),{recursive:true}); fs.writeFileSync(file, JSON.stringify(s,null,2)); }
-async function tx<T>(fn:(s:State)=>T|Promise<T>):Promise<T> { const run = queue.then(async()=>{const s=load(); const out=await fn(s); save(s); return out;}); queue=run.then(()=>undefined,()=>undefined); return run; }
-function hash(password:string, salt=crypto.randomBytes(16).toString("hex")) { return `${salt}:${crypto.scryptSync(password,salt,32).toString("hex")}`; }
-function matches(password:string, stored:string) { const [salt,hex]=stored.split(":"); if(!salt||!hex) return false; const a=Buffer.from(hex,"hex"); const b=crypto.scryptSync(password,salt,32); return a.length===b.length&&crypto.timingSafeEqual(a,b); }
-const id=()=>crypto.randomUUID();
-export async function register(name:string,email:string,password:string) { return tx(s=>{ if(s.users.some(u=>u.email.toLowerCase()===email.toLowerCase())) throw new Error("Email already registered"); const user={id:id(),name,email:email.toLowerCase(),passwordHash:hash(password),createdAt:new Date().toISOString()}; s.users.push(user); const token=id(); s.sessions.push({token,userId:user.id,createdAt:new Date().toISOString()}); return {user:{id:user.id,name:user.name,email:user.email},token}; }); }
-export async function login(email:string,password:string) { return tx(s=>{const user=s.users.find(u=>u.email===email.toLowerCase()); if(!user||!matches(password,user.passwordHash)) throw new Error("Invalid email or password"); const token=id(); s.sessions.push({token,userId:user.id,createdAt:new Date().toISOString()}); return {user:{id:user.id,name:user.name,email:user.email},token}; }); }
-export async function userForToken(token:string|undefined) { if(!token)return null; const s=load(); const session=s.sessions.find(x=>x.token===token); const u=session&&s.users.find(x=>x.id===session.userId); return u?{id:u.id,name:u.name,email:u.email}:null; }
-export async function createNote(ownerId:string,title:string,content:string,opts:{accessType:"public"|"password";shareType:"one-time"|"time-based";expiryAt:string|null}) { return tx(s=>{const note:Note={id:id(),ownerId,title,content,createdAt:new Date().toISOString()}; const token=crypto.randomBytes(24).toString("base64url"); const accessKey=opts.accessType==="password"?crypto.randomBytes(8).toString("base64url"):null; const share:Share={id:id(),noteId:note.id,token,accessType:opts.accessType,shareType:opts.shareType,expiryAt:opts.shareType==="time-based"?opts.expiryAt:null,accessKeyHash:accessKey?hash(accessKey):null,accessKeyHint:accessKey?`${accessKey.slice(0,3)}•••`:null,usedAt:null,revokedAt:null,viewCount:0,createdAt:new Date().toISOString()}; s.notes.push(note);s.shares.push(share); return {note,share,accessKey}; }); }
-export async function notesFor(ownerId:string) { const s=load(); return s.notes.filter(n=>n.ownerId===ownerId).map(note=>({note,shares:s.shares.filter(x=>x.noteId===note.id)})); }
-export async function noteFor(ownerId:string,noteId:string) { const s=load(); const note=s.notes.find(n=>n.id===noteId&&n.ownerId===ownerId); return note?{note,shares:s.shares.filter(x=>x.noteId===note.id)}:null; }
-export async function revokeShare(ownerId:string,token:string) { return tx(s=>{const share=s.shares.find(x=>x.token===token); const note=share&&s.notes.find(n=>n.id===share.noteId&&n.ownerId===ownerId); if(!share||!note) throw new Error("Share not found"); share.revokedAt=new Date().toISOString(); return share;}); }
-export async function accessShare(token:string,password?:string) { return tx(s=>{const share=s.shares.find(x=>x.token===token); const note=share&&s.notes.find(n=>n.id===share.noteId); if(!share||!note) return {status:404 as const,error:"Invalid share link"}; if(share.revokedAt) return {status:410 as const,error:"This link was revoked"}; if(share.expiryAt&&new Date(share.expiryAt).getTime()<=Date.now()) return {status:410 as const,error:"This link has expired"}; if(share.accessType==="password"&&(!password||!share.accessKeyHash||!matches(password,share.accessKeyHash))) return {status:401 as const,error:"Incorrect password/key"}; if(share.shareType==="one-time"&&share.usedAt) return {status:410 as const,error:"This one-time link was already used"}; share.viewCount+=1; if(share.shareType==="one-time") share.usedAt=new Date().toISOString(); return {status:200 as const,note:{title:note.title,content:note.content},share:{accessType:share.accessType,shareType:share.shareType,viewCount:share.viewCount,expiryAt:share.expiryAt}}; }); }
+const scrypt = promisify(crypto.scrypt);
+const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+
+export type PublicUser = { id: string; name: string; email: string };
+export type PublicShare = {
+  id: string;
+  noteId: string;
+  token: string;
+  accessType: "public" | "password";
+  shareType: "one-time" | "time-based";
+  expiryAt: string | null;
+  usedAt: string | null;
+  revokedAt: string | null;
+  viewCount: number;
+  createdAt: string;
+};
+
+function randomId() {
+  return crypto.randomUUID();
+}
+
+function randomToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+async function hashSecret(secret: string, salt = crypto.randomBytes(16).toString("hex")) {
+  const derived = await scrypt(secret, salt, 32) as Buffer;
+  return `${salt}:${derived.toString("hex")}`;
+}
+
+async function secretMatches(secret: string, stored: string) {
+  const [salt, hex] = stored.split(":");
+  if (!salt || !hex) return false;
+  const expected = Buffer.from(hex, "hex");
+  const actual = await scrypt(secret, salt, 32) as Buffer;
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function publicShare(row: typeof shares.$inferSelect): PublicShare {
+  return {
+    id: row.id,
+    noteId: row.noteId,
+    token: row.token,
+    accessType: row.accessType as PublicShare["accessType"],
+    shareType: row.shareType as PublicShare["shareType"],
+    expiryAt: row.expiryAt?.toISOString() ?? null,
+    usedAt: row.usedAt?.toISOString() ?? null,
+    revokedAt: row.revokedAt?.toISOString() ?? null,
+    viewCount: row.viewCount,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function createSession(userId: string) {
+  const token = randomToken();
+  await getDatabase().insert(sessions).values({
+    token,
+    userId,
+    expiresAt: new Date(Date.now() + SESSION_LIFETIME_MS),
+  });
+  return token;
+}
+
+export async function register(name: string, email: string, password: string) {
+  const database = getDatabase();
+  const id = randomId();
+  try {
+    await database.insert(users).values({ id, name, email, passwordHash: await hashSecret(password) });
+  } catch (error) {
+    if ((error as { code?: string }).code === "23505" || String(error).includes("users_email_unique")) {
+      throw new Error("Email already registered");
+    }
+    throw error;
+  }
+  return { user: { id, name, email } satisfies PublicUser, token: await createSession(id) };
+}
+
+export async function login(email: string, password: string) {
+  const [user] = await getDatabase().select().from(users).where(eq(users.email, email)).limit(1);
+  if (!user || !(await secretMatches(password, user.passwordHash))) throw new Error("Invalid email or password");
+  return {
+    user: { id: user.id, name: user.name, email: user.email } satisfies PublicUser,
+    token: await createSession(user.id),
+  };
+}
+
+export async function logout(token: string | undefined) {
+  if (token) await getDatabase().delete(sessions).where(eq(sessions.token, token));
+}
+
+export async function userForToken(token: string | undefined) {
+  if (!token) return null;
+  const [row] = await getDatabase()
+    .select({ id: users.id, name: users.name, email: users.email })
+    .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.userId))
+    .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function createNote(ownerId: string, input: CreateNoteInput) {
+  const database = getDatabase();
+  const note = {
+    id: randomId(),
+    ownerId,
+    title: input.title,
+    content: input.content,
+    createdAt: new Date(),
+  };
+  const accessKey = input.accessType === "password" ? randomToken(12) : null;
+  const share = {
+    id: randomId(),
+    noteId: note.id,
+    token: randomToken(24),
+    accessType: input.accessType,
+    shareType: input.shareType,
+    expiryAt: input.expiryAt,
+    accessKeyHash: accessKey ? await hashSecret(accessKey) : null,
+    viewCount: 0,
+    createdAt: new Date(),
+  };
+  await database.batch([
+    database.insert(notes).values(note),
+    database.insert(shares).values(share),
+  ]);
+  return {
+    note: { ...note, createdAt: note.createdAt.toISOString() },
+    share: publicShare({ ...share, usedAt: null, revokedAt: null }),
+    accessKey,
+  };
+}
+
+export async function notesFor(ownerId: string) {
+  const rows = await getDatabase()
+    .select({ note: notes, share: shares })
+    .from(notes)
+    .leftJoin(shares, eq(shares.noteId, notes.id))
+    .where(eq(notes.ownerId, ownerId));
+  const grouped = new Map<string, { note: typeof notes.$inferSelect; shares: PublicShare[] }>();
+  for (const row of rows) {
+    const item = grouped.get(row.note.id) ?? { note: row.note, shares: [] };
+    if (row.share) item.shares.push(publicShare(row.share));
+    grouped.set(row.note.id, item);
+  }
+  return [...grouped.values()];
+}
+
+export async function noteFor(ownerId: string, noteId: string) {
+  const [note] = await getDatabase().select().from(notes).where(and(eq(notes.id, noteId), eq(notes.ownerId, ownerId))).limit(1);
+  if (!note) return null;
+  const noteShares = await getDatabase().select().from(shares).where(eq(shares.noteId, noteId));
+  return { note, shares: noteShares.map(publicShare) };
+}
+
+export async function revokeShare(ownerId: string, token: string) {
+  const [updated] = await getDatabase()
+    .update(shares)
+    .set({ revokedAt: new Date() })
+    .where(and(
+      eq(shares.token, token),
+      isNull(shares.revokedAt),
+      sql`exists (select 1 from ${notes} where ${notes.id} = ${shares.noteId} and ${notes.ownerId} = ${ownerId})`,
+    ))
+    .returning();
+  if (!updated) throw new Error("Share not found");
+  return publicShare(updated);
+}
+
+export async function consumeRateLimit(key: string, limit = 10, windowMinutes = 10) {
+  const [result] = await getDatabase()
+    .insert(rateLimits)
+    .values({ key, count: 1, windowStartedAt: new Date() })
+    .onConflictDoUpdate({
+      target: rateLimits.key,
+      set: {
+        count: sql`case when ${rateLimits.windowStartedAt} < now() - make_interval(mins => ${windowMinutes}) then 1 else ${rateLimits.count} + 1 end`,
+        windowStartedAt: sql`case when ${rateLimits.windowStartedAt} < now() - make_interval(mins => ${windowMinutes}) then now() else ${rateLimits.windowStartedAt} end`,
+      },
+    })
+    .returning({ count: rateLimits.count });
+  return (result?.count ?? limit + 1) <= limit;
+}
+
+export async function accessShare(token: string, password: string | undefined, clientKey: string) {
+  const database = getDatabase();
+  const [row] = await database
+    .select({ share: shares, note: notes })
+    .from(shares)
+    .innerJoin(notes, eq(notes.id, shares.noteId))
+    .where(eq(shares.token, token))
+    .limit(1);
+  if (!row) return { status: 404 as const, error: "Invalid share link" };
+  if (row.share.revokedAt) return { status: 410 as const, error: "This link was revoked" };
+  if (row.share.expiryAt && row.share.expiryAt.getTime() <= Date.now()) return { status: 410 as const, error: "This link has expired" };
+  if (row.share.accessType === "password") {
+    if (!(await consumeRateLimit(`share:${token}:${clientKey}`))) return { status: 429 as const, error: "Too many attempts. Try again later" };
+    if (!password || !row.share.accessKeyHash || !(await secretMatches(password, row.share.accessKeyHash))) {
+      return { status: 401 as const, error: "Incorrect password/key" };
+    }
+  }
+
+  const baseConditions = [eq(shares.id, row.share.id), isNull(shares.revokedAt)];
+  if (row.share.expiryAt) baseConditions.push(gt(shares.expiryAt, new Date()));
+  if (row.share.shareType === "one-time") baseConditions.push(isNull(shares.usedAt));
+  const [claimed] = await database
+    .update(shares)
+    .set({
+      viewCount: sql`${shares.viewCount} + 1`,
+      ...(row.share.shareType === "one-time" ? { usedAt: new Date() } : {}),
+    })
+    .where(and(...baseConditions))
+    .returning({ viewCount: shares.viewCount });
+  if (!claimed) {
+    const [latest] = await database.select().from(shares).where(eq(shares.id, row.share.id)).limit(1);
+    if (latest?.revokedAt) return { status: 410 as const, error: "This link was revoked" };
+    if (latest?.expiryAt && latest.expiryAt.getTime() <= Date.now()) return { status: 410 as const, error: "This link has expired" };
+    return { status: 410 as const, error: "This one-time link was already used" };
+  }
+  return {
+    status: 200 as const,
+    note: { title: row.note.title, content: row.note.content },
+    share: {
+      accessType: row.share.accessType,
+      shareType: row.share.shareType,
+      viewCount: claimed.viewCount,
+      expiryAt: row.share.expiryAt?.toISOString() ?? null,
+    },
+  };
+}

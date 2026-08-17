@@ -1,5 +1,21 @@
 import { NextResponse } from "next/server";
 import { currentUser } from "../../../lib/auth";
 import { createNote, notesFor } from "../../../lib/store";
-export async function GET(){const user=await currentUser();if(!user)return NextResponse.json({error:"Sign in required"},{status:401});return NextResponse.json({items:await notesFor(user.id)});}
-export async function POST(req:Request){const user=await currentUser();if(!user)return NextResponse.json({error:"Sign in required"},{status:401});try{const body=await req.json();if(!body.title||!body.content)return NextResponse.json({error:"Title and content required"},{status:400});const out=await createNote(user.id,body.title,body.content,{accessType:body.accessType,shareType:body.shareType,expiryAt:body.expiryAt||null});return NextResponse.json(out,{status:201});}catch(e){return NextResponse.json({error:e instanceof Error?e.message:"Unable to create note"},{status:400});}}
+import { parseCreateNoteInput } from "../../../lib/validation";
+
+export async function GET() {
+  const user = await currentUser();
+  if (!user) return NextResponse.json({ error: "Sign in required" }, { status: 401 });
+  return NextResponse.json({ items: await notesFor(user.id) });
+}
+
+export async function POST(request: Request) {
+  const user = await currentUser();
+  if (!user) return NextResponse.json({ error: "Sign in required" }, { status: 401 });
+  try {
+    const input = parseCreateNoteInput(await request.json());
+    return NextResponse.json(await createNote(user.id, input), { status: 201 });
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to create note" }, { status: 400 });
+  }
+}

@@ -1,3 +1,19 @@
 import { NextResponse } from "next/server";
-import { login } from "../../../../lib/store";
-export async function POST(req:Request){try{const {email,password}=await req.json();const out=await login(email,password);const res=NextResponse.json({user:out.user});res.cookies.set("session",out.token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:60*60*24*30,path:"/"});return res;}catch(e){return NextResponse.json({error:e instanceof Error?e.message:"Unable to sign in"},{status:401});}}
+import { clientKey, setSessionCookie } from "../../../../lib/http";
+import { consumeRateLimit, login } from "../../../../lib/store";
+import { parseCredentials } from "../../../../lib/validation";
+
+export async function POST(request: Request) {
+  try {
+    const { email, password } = parseCredentials(await request.json(), "login");
+    if (!(await consumeRateLimit(`login:${clientKey(request)}:${email}`, 8, 15))) {
+      return NextResponse.json({ error: "Too many attempts. Try again later" }, { status: 429 });
+    }
+    const result = await login(email, password);
+    const response = NextResponse.json({ user: result.user });
+    setSessionCookie(response, result.token);
+    return response;
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unable to sign in" }, { status: 401 });
+  }
+}
