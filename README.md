@@ -1,36 +1,69 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Linknote — Peacock India assessment
 
-## Getting Started
+A secure expiring note-sharing app built with Next.js 16, TypeScript, Tailwind CSS, Neon PostgreSQL, and Drizzle ORM.
 
-First, run the development server:
+## Submission
+
+- Live app: https://peacock-note-poc.vercel.app
+- Repository: https://github.com/Dhruv2mars/peacock-note-poc
+- Demo video: https://github.com/Dhruv2mars/peacock-note-poc/releases/download/v0.1.0/peacock-poc-demo.webm
+- Review account: `reviewer.e2e.20260817@example.com` / `PeacockDemo!2026`
+
+The review account and production deployment were exercised with real browser E2E flows on August 17, 2026.
+
+## Features
+
+- Registration, sign-in, expiring database sessions, sign-out, and protected owner routes
+- Private notes with public or generated-key access
+- One-time links with an atomic claim and time-based links with server-enforced expiry
+- Owner controls, successful-view counts, and immediate revocation
+- Salted asynchronous scrypt hashes for passwords and access keys; raw access keys are shown once
+- PostgreSQL-backed rate limiting for login and protected-link attempts
+- Strict request validation and sanitized responses that never expose hashes
+
+## Run locally
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
+bun install
+cp .env.example .env.local
+bun run db:push
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Set `DATABASE_URL` in `.env.local` to a PostgreSQL connection string. Open `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Verification
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+bun run lint
+bun run build
+bun run test:e2e
+```
 
-## Learn More
+The API suite covers malformed input, secret non-disclosure, logout invalidation, wrong-key counting, one-time replay, eight concurrent claims, revocation, expiry, and brute-force throttling. It can target production with:
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+E2E_BASE_URL=https://peacock-note-poc.vercel.app bun run test:e2e
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Assessment answers
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### How do you prevent simultaneous use of a one-time link?
 
-## Deploy on Vercel
+The claim is one conditional PostgreSQL update: `UPDATE shares ... WHERE used_at IS NULL AND revoked_at IS NULL ... RETURNING`. Only one concurrent request can receive a returned row. The production test sends eight simultaneous requests and asserts exactly one `200`; every other request receives `410`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### How is the view count updated safely?
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The successful view increment happens in the same conditional update as the one-time claim. Authentication, expiry, and revocation checks happen first, and the update repeats the mutable guards. Wrong keys, expired links, revoked links, invalid tokens, and consumed links never increment the counter.
+
+### How would this handle one million opens?
+
+Tokens and ownership columns are indexed. Stateless Vercel functions can scale horizontally while Neon remains the source of truth. Public note payloads can be cached or read-replicated, but claim, revocation, and exact-count writes stay on the primary. At sustained high write volume, partition shares by token hash and stream non-critical aggregate analytics separately; one-time claims remain synchronous and strongly consistent.
+
+### How is brute force prevented?
+
+Access keys are 96-bit cryptographically random values. Only salted scrypt hashes are stored and comparisons are timing-safe. Attempts are rate-limited in PostgreSQL by share token and client IP; login attempts are also throttled. Production should additionally place equivalent limits at the edge and alert on abnormal bursts.
+
+## Data model and security boundaries
+
+`users`, `sessions`, `notes`, `shares`, and `rate_limits` are persisted in PostgreSQL with foreign keys, uniqueness constraints, checks, and indexes. Session cookies are random, `httpOnly`, `sameSite=lax`, secure in production, and expire after 30 days. Owner APIs derive identity from the server-side session; callers cannot choose an owner ID.
