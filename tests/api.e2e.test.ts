@@ -79,7 +79,7 @@ describe("Linknote public API", () => {
     expect(success.status).toBe(200);
     expect((await success.json()).share.viewCount).toBe(1);
     expect(replay.status).toBe(410);
-  });
+  }, 30_000);
 
   test("only one concurrent request consumes a one-time link", async () => {
     const { cookie } = await register();
@@ -102,7 +102,17 @@ describe("Linknote public API", () => {
 
     const expiredCreated = await createNote(cookie, { shareType: "time-based", expiryAt: new Date(Date.now() - 60_000).toISOString() });
     expect(expiredCreated.status).toBe(400);
-  });
+
+    const timedCreated = await createNote(cookie, {
+      shareType: "time-based",
+      expiryAt: new Date(Date.now() + 2_500).toISOString(),
+    });
+    const timed = await timedCreated.json() as { share: { token: string } };
+    const timedUrl = `${baseUrl}/api/share/${timed.share.token}`;
+    expect((await fetch(timedUrl, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status).toBe(200);
+    await Bun.sleep(3_000);
+    expect((await fetch(timedUrl, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status).toBe(410);
+  }, 30_000);
 
   test("password links rate-limit brute-force attempts", async () => {
     const { cookie } = await register();
@@ -116,5 +126,5 @@ describe("Linknote public API", () => {
     }
     expect(statuses.slice(0, 10)).toEqual(Array(10).fill(401));
     expect(statuses[10]).toBe(429);
-  });
+  }, 30_000);
 });
