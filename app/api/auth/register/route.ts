@@ -1,0 +1,3 @@
+import { NextResponse } from "next/server";
+import { register } from "../../../../lib/store";
+export async function POST(req:Request){try{const {name,email,password}=await req.json();if(!name||!email||!password||password.length<8)return NextResponse.json({error:"Name, email, and 8+ character password required"},{status:400});const out=await register(name,email,password);const res=NextResponse.json({user:out.user});res.cookies.set("session",out.token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:60*60*24*30,path:"/"});return res;}catch(e){return NextResponse.json({error:e instanceof Error?e.message:"Unable to register"},{status:400});}}

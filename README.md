@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Linknote — Peacock India MERN/PERN POC
 
-## Getting Started
+Secure expiring note-sharing app built with Next.js App Router, TypeScript, Tailwind CSS, and server route handlers.
 
-First, run the development server:
+## Run locally
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
+bun install
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000`. Register with any email and an 8+ character password. Demo state is written to `.data/store.json` (ignored from git) so the POC runs without external credentials. A production deployment should replace `lib/store.ts` with a PostgreSQL adapter and keep the same transaction boundaries.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Flow
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Register or sign in.
+2. Create a note and select public/password access plus one-time/time-based sharing.
+3. Password links generate a high-entropy access key. Only its salted scrypt hash is stored; the raw key is shown once.
+4. Share URL opens `/share/[token]`. The server validates revoke/expiry, verifies the key, atomically consumes one-time links, and increments view count only on success.
+5. Note controls show links and counts. Owners can revoke active links.
 
-## Learn More
+## Security decisions
 
-To learn more about Next.js, take a look at the following resources:
+- Session tokens are random, httpOnly, same-site cookies.
+- Passwords and access keys use Node `scryptSync` with random salts; comparisons use `timingSafeEqual`.
+- All share state changes run through one serialized transaction queue. The one-time `usedAt` check and write happen in the same critical section, so concurrent requests cannot both succeed.
+- Wrong key, expired, revoked, invalid, or already-consumed links never increment `viewCount`.
+- For production scale: use PostgreSQL row locks/conditional updates for the one-time claim, a rate limiter keyed by token/IP for brute-force protection, and a cache/CDN for immutable public note payloads while keeping claim/count writes strongly consistent.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Required assessment answers
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**How prevent two users using one-time link simultaneously?** Perform `usedAt IS NULL` check plus claim in one database transaction/conditional update. This POC serializes that critical section; PostgreSQL should use `UPDATE ... WHERE used_at IS NULL RETURNING`.
 
-## Deploy on Vercel
+**How update view count safely?** Increment only after all checks pass, inside the same transaction as the one-time claim. Never increment on failed password, expiry, revoke, or invalid-token paths.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+**How handle 1 million opens?** Cache/read-replicate note payloads, keep token metadata indexed by token, route writes to a primary, and use an atomic claim endpoint with rate limiting. Counts can be sharded or queued for non-one-time links if exact synchronous counts are not required.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**How prevent brute force?** Store only a hash, rate-limit by token and IP, add exponential backoff/temporary lockout, alert on bursts, and use a long random key (this POC uses 64 bits of random key material plus a salted hash).
+
+## Verification
+
+```bash
+bun run build
+```
+
+Manual API smoke test covered: wrong key → `401` with count `0`; correct key → `200` with count `1`; second one-time open → `410` with count unchanged.
+
+## Submission package
+
+- Live demo URL: deploy this app to a host with a PostgreSQL adapter and `NODE_ENV=production`.
+- GitHub repository: this directory is ready to push as `peacock-note-poc`.
+- Demo video: record the flow in the order listed in the assessment: create note, public link, password link, wrong key, one-time reuse, time expiry, revoke, and view count.
+- Test account: create one through `/register`; do not commit credentials.
