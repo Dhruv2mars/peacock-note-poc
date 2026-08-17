@@ -9,8 +9,9 @@ type State = { users:User[]; notes:Note[]; shares:Share[]; sessions:{token:strin
 const file = path.join(process.cwd(), ".data", "store.json");
 let queue = Promise.resolve();
 const blank = ():State => ({users:[],notes:[],shares:[],sessions:[]});
-function load():State { try { return JSON.parse(fs.readFileSync(file,"utf8")); } catch { return blank(); } }
-function save(s:State) { fs.mkdirSync(path.dirname(file),{recursive:true}); fs.writeFileSync(file, JSON.stringify(s,null,2)); }
+const runtime = globalThis as typeof globalThis & { __linknoteState?: State };
+function load():State { if(process.env.VERCEL) return runtime.__linknoteState ?? (runtime.__linknoteState=blank()); try { return JSON.parse(fs.readFileSync(file,"utf8")); } catch { return blank(); } }
+function save(s:State) { if(process.env.VERCEL){ runtime.__linknoteState=s; return; } fs.mkdirSync(path.dirname(file),{recursive:true}); fs.writeFileSync(file, JSON.stringify(s,null,2)); }
 async function tx<T>(fn:(s:State)=>T|Promise<T>):Promise<T> { const run = queue.then(async()=>{const s=load(); const out=await fn(s); save(s); return out;}); queue=run.then(()=>undefined,()=>undefined); return run; }
 function hash(password:string, salt=crypto.randomBytes(16).toString("hex")) { return `${salt}:${crypto.scryptSync(password,salt,32).toString("hex")}`; }
 function matches(password:string, stored:string) { const [salt,hex]=stored.split(":"); if(!salt||!hex) return false; const a=Buffer.from(hex,"hex"); const b=crypto.scryptSync(password,salt,32); return a.length===b.length&&crypto.timingSafeEqual(a,b); }
